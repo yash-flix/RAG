@@ -1,0 +1,73 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# VS Code
+.vscode/
+
+# dotenv
+.env
+.env.*
+
+# Byte-compiled / optimized / DLL files
+*.pyc
+*.pyo
+*.pyd
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Unit test / coverage
+.coverage
+htmlcov/
+.pytest_cache/
+
+# IPython
+.ipynb_checkpoints
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs and databases
+*.log
+*.sqlite3
+
+# IDEs
+.idea/
+
+# pip cache / metadata
+pip-wheel-metadata/
+
+# Large or sensitive files
+aws-guide.pdf
+
+# Local environment files
+.env.local
+
+# Chroma DB (persisted vector store)
+chroma_db/
+
+# macOS
+*.DS_Store
+
+# Windows
+Thumbs.db
+
+# Temporary files
+*.tmp
+
