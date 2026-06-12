@@ -1,282 +1,275 @@
-from dotenv import load_dotenv
 
+from dotenv import load_dotenv
 load_dotenv()
 
-from typing import TypedDict
+#  Imports 
 
-from langgraph.graph import (
-    StateGraph,
-    START , 
-    END
+from typing import TypedDict, Annotated, List
+import operator
+
+from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.memory import MemorySaver
+
+from langchain_core.messages import (
+    BaseMessage,
+    HumanMessage,
+    AIMessage,
+    SystemMessage
 )
 
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
-
-# LLM
 from langchain_groq import ChatGroq
-
-# Prompt
 from langchain_core.prompts import PromptTemplate
-
-# Output Parser
 from langchain_core.output_parsers import StrOutputParser
 
-# Runnable Components
-from langchain_core.runnables import RunnablePassthrough
- 
+
+# Step 1: State schema 
+
+class State(TypedDict):
+    messages:            Annotated[List[BaseMessage], operator.add]
+    question:            str
+    rewritten_question:  str
+    context:             str
+    answer:              str
+    relevance_score:     float
+
+
+#  Step 2: Load components 
 
 embedding_model = HuggingFaceEmbeddings(
     model_name="sentence-transformers/all-MiniLM-L6-v2"
 )
 
-
-
 vectorstore = Chroma(
     persist_directory="./chroma_db",
     embedding_function=embedding_model
 )
-
 print("Vector DB loaded")
 
 retriever = vectorstore.as_retriever(
-    search_type =  "mmr",
-    search_kwargs = {"k" : 5 , "fetch_k": 20}
+    search_type="mmr",
+    search_kwargs={"k": 5, "fetch_k": 20}
 )
 
-
-
-
-def format_docs(docs):
-
-    formatted = []
-
-    for doc in docs:
-
-        source = doc.metadata.get(
-            "source",
-            "Unknown"
-        )
-
-        page = doc.metadata.get(
-            "page_label",
-            "Unknown"
-        )
-
-        formatted.append(
-            f"""
-Source: {source}
-Page: {page}
-
-Content:
-{doc.page_content}
-"""
-        )
-
-    return "\n\n".join(formatted)
-
-prompt = PromptTemplate.from_template(
-"""
-You are an AWS expert.
-
-Answer ONLY using the provided context.
-
-If the answer is not present in the context,
-respond with:
-
-"I could not find this information in the document."
-
-At the end of your answer,
-mention the source document and page number used.
-
-Context:
-{context}
-
-Question:
-{question}
-"""
-)
-#Step 6: Load LLM
-
-llm = ChatGroq(
-    model = "llama-3.3-70b-versatile"
-)
-
-#Step 7 : Output parser 
+llm    = ChatGroq(model="llama-3.3-70b-versatile")
 parser = StrOutputParser()
 
-#LangGraph state graph
-class State(TypedDict):
-    question:str
-    rewritten_question : str
-    context:str
-    answer:str
-    relevance_score: float
+# ChromaDB L2 distance threshold.
+# Lower = closer match. Scores below this are considered relevant.
+RELEVANCE_THRESHOLD = 0.8
 
-def retrieve(state: State):
+SYSTEM_PROMPT = SystemMessage(content="""
+You are an AWS expert.
+Answer ONLY using the provided context.
+If the answer is not present in the context, say:
+"I could not find this information in the document."
+At the end of your answer, mention the source document and page number used.
+""")
 
-    print("\n--- RETRIEVE NODE ---\n")
 
-    print("Incoming State:")
-    print(state)
+#  Step 3: Helper 
+
+def format_docs(docs):
+    formatted = []
+    for doc in docs:
+        source = doc.metadata.get("source", "Unknown")
+        page   = doc.metadata.get("page_label", "Unknown")
+        formatted.append(
+            f"Source: {source}\nPage: {page}\n\nContent:\n{doc.page_content}"
+        )
+    return "\n\n".join(formatted)
+
+
+#  Step 4: Nodes 
+
+# Node 1: rewrite_query 
+
+rewrite_prompt = PromptTemplate.from_template("""
+You are a query rewriting assistant.
+
+Given the conversation history and the user's latest question,
+rewrite the question into a fully standalone question that can be
+understood without the history.
+
+If the question is already standalone, return it unchanged.
+Return ONLY the rewritten question — no explanation.
+
+Conversation History:
+{history}
+
+Latest Question:
+{question}
+""")
+
+def rewrite_query(state: State) -> dict:
+    print("\n--- REWRITE NODE ---")
+
+    # Build a readable history string from past messages
+    history_lines = []
+    for msg in state["messages"]:
+        role = "User" if isinstance(msg, HumanMessage) else "Assistant"
+        history_lines.append(f"{role}: {msg.content}")
+    history_text = "\n".join(history_lines) if history_lines else "None"
+
+    formatted = rewrite_prompt.invoke({
+        "question": state["question"],
+        "history":  history_text
+    })
+    response = llm.invoke(formatted)
+    rewritten = parser.invoke(response)
+
+    print(f"Original : {state['question']}")
+    print(f"Rewritten: {rewritten}")
+
+    return {"rewritten_question": rewritten}
+
+
+# Node 2: retrieve 
+#
+
+def retrieve(state: State) -> dict:
+    print("\n--- RETRIEVE NODE ---")
 
     results = vectorstore.similarity_search_with_score(
         state["rewritten_question"],
         k=5
     )
 
-    print("\nSimilarity Scores:\n")
-
+    print("\nSimilarity Scores (L2 distance — lower = more relevant):")
     for i, (doc, score) in enumerate(results):
-        print(f"Chunk {i+1}: {score}")
+        print(f"  Chunk {i+1}: {score:.4f}")
 
-    best_score = results[0][1]
-
-    docs = [
-        doc
-        for doc, score in results
-    ]
-
-    context = format_docs(docs)
+    best_score = results[0][1]  # lowest distance = most relevant chunk
+    docs = [doc for doc, _ in results]
 
     return {
-        "context": context,
+        "context":  format_docs(docs),
         "relevance_score": best_score
     }
 
-def generate(state:State):
-    print("Generating answer...")
-    
-    formated_prompt = prompt.invoke(
-        {
-            "question": state["question"],
-             "context": state["context"]
-        }
-    )
-    response = llm.invoke(formated_prompt)
 
-    answer = parser.invoke(response)
+#  Node 3: generate 
 
-    return {
-        "answer": answer
-    }
+def generate(state: State) -> dict:
+    print("\n GENERATE NODE ")
 
-rewrite_prompt = PromptTemplate.from_template(
-"""
-You are a query rewriting assistant.
+    history = state["messages"]
 
-Convert the user's question into a standalone question
-that can be understood without previous conversation.
+    # Combine retrieved context + rewritten question as the latest human turn
+    current_turn = HumanMessage(content=f"""
+Context from documents:
+{state['context']}
 
-If the question is already standalone,
-return it unchanged.
+Question: {state['rewritten_question']}
+""")
 
-Question:
-{question}
-"""
-)
+    # LLM sees: system prompt + full history + current turn
+    messages_for_llm = [SYSTEM_PROMPT] + history + [current_turn]
+    response         = llm.invoke(messages_for_llm)
+    answer           = parser.invoke(response)
 
-def rewrite_query(state: State):
-    print("Rewriting question...")
+    print(f"\nAnswer:\n{answer}")
 
-    formated_prompt = rewrite_prompt.invoke(
-        {
-            "question": state["question"]
-        }
-    )
-    response = llm.invoke(formated_prompt)
-
-    rewritten_question = parser.invoke(response)
 
     return {
-        "rewritten_question" : rewritten_question
+        "answer": answer,
+        "messages": [
+            HumanMessage(content=state["question"]),
+            AIMessage(content=answer)
+        ]
     }
 
-graph_builder = StateGraph(State)
 
-def not_found(state: State):
+#  Node 4: not_found 
 
+def not_found(state: State) -> dict:
+    print("\n--- NOT FOUND NODE ---")
+    answer = "I could not find relevant information in the document."
+    print(answer)
+
+    # Still append to history so the LLM knows this question was unanswerable
     return {
-        "answer":
-        "I could not find relevant information in the document."
+        "answer": answer,
+        "messages": [
+            HumanMessage(content=state["question"]),
+            AIMessage(content=answer)
+        ]
     }
 
-def route_question(state: State):
 
+# Step 5: Router 
+
+def route_question(state: State) -> str:
     score = state["relevance_score"]
+    print(f"\nRouting — best L2 score: {score:.4f}  (threshold: {RELEVANCE_THRESHOLD})")
 
-    print(f"\nRelevance Score: {score}")
-
-    if score < 0.8:
+    if score < RELEVANCE_THRESHOLD:
+        print("→ Relevant docs found → generate")
         return "generate"
 
+    print("→ No relevant docs found → not_found")
     return "not_found"
 
 
-# Nodes
+#  Step 6: Build graph 
 
-graph_builder.add_node(
-    "rewrite",
-    rewrite_query
-)
+graph_builder = StateGraph(State)
 
-graph_builder.add_node(
-    "retrieve",
-    retrieve
-)
+graph_builder.add_node("rewrite",   rewrite_query)
+graph_builder.add_node("retrieve",  retrieve)
+graph_builder.add_node("generate",  generate)
+graph_builder.add_node("not_found", not_found)
 
-graph_builder.add_node(
-    "generate",
-    generate
-)
-graph_builder.add_node(
-    "not_found",
-    not_found
-)
-
-# Edges
-
-graph_builder.add_edge(
-    START,
-    "rewrite"
-)
-
-graph_builder.add_edge(
-    "rewrite",
-    "retrieve"
-)
+graph_builder.add_edge(START,      "rewrite")
+graph_builder.add_edge("rewrite",  "retrieve")
 
 graph_builder.add_conditional_edges(
     "retrieve",
     route_question,
     {
-        "generate": "generate",
+        "generate":  "generate",
         "not_found": "not_found"
     }
 )
 
-graph_builder.add_edge(
-    "generate",
-    END
-)
+graph_builder.add_edge("generate",  END)
+graph_builder.add_edge("not_found", END)
 
-graph_builder.add_edge(
-    "not_found",
-    END
-)
+memory = MemorySaver()
+app    = graph_builder.compile(checkpointer=memory)
+print("Graph compiled successfully\n")
 
 
-app = graph_builder.compile()
+# Step 7: Chat loop
 
-print("Graph compiled successfully")
-print("Invoking graph...")
+config = {"configurable": {"thread_id": "user_1"}}
 
-result = app.invoke(
-    {
-        "question": "What is Kubernetes?"
-    }
-)
-print(result)
+print("AWS RAG Chatbot  |  memory + query rewriting + relevance gating")
+print("Type 'exit' to quit\n")
 
+while True:
+    question = input("Ask: ").strip()
 
+    if not question:
+        continue
 
+    if question.lower() in ["exit", "quit", "bye"]:
+        print("Goodbye!")
+        break
+
+    result = app.invoke(
+        {
+            "question": question,
+            "messages": [],          # MemorySaver merges with saved history
+            "rewritten_question": "",
+            "context": "",
+            "answer": "",
+            "relevance_score": 0.0
+        },
+        config=config
+    )
+
+    print(f"\n{'─'*55}")
+    print(result["answer"])
+    print(f"{'─'*55}\n")
