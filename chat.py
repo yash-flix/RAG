@@ -17,7 +17,8 @@ from langchain_core.output_parsers import StrOutputParser
 # Runnable Components
 from langchain_core.runnables import RunnablePassthrough
  
- 
+
+
 embedding_model = HuggingFaceEmbeddings(
     model_name="sentence-transformers/all-MiniLM-L6-v2"
 )
@@ -123,7 +124,7 @@ while True:
 
     retrieved_docs = retriever.invoke(question)
 
-    print("\n========== RETRIEVED DOCS ==========\n")
+    print("\nRETRIEVED DOCS\n")
 
     for i, doc in enumerate(retrieved_docs):
 
