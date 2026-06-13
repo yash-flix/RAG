@@ -13,6 +13,9 @@ from langchain_core.messages import (
     AIMessage
 )
 
+os.makedirs("uploads", exist_ok=True)
+os.makedirs("chroma_db", exist_ok=True)
+
 st.set_page_config(
     page_title="DocMind",
     page_icon="◆",

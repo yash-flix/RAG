@@ -205,6 +205,12 @@ def build_graph(vectorstore):
             print(
                 f"Page: {doc.metadata.get('page')}"
             )
+            if not ranked:
+              return {
+        "reranked_context": "",
+        "docs": [],
+        "relevance_score": 0.0
+                     }
 
         best_rerank_score = ranked[0][1]
 
