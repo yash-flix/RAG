@@ -9,7 +9,7 @@ import operator
 
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
-
+from langchain_core.documents import Document
 from langchain_core.messages import (
     BaseMessage,
     HumanMessage,
@@ -22,21 +22,28 @@ from langchain_chroma import Chroma
 from langchain_groq import ChatGroq
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
+from sentence_transformers import CrossEncoder
 
 
 # Step 1: State schema 
 
 class State(TypedDict):
     messages:            Annotated[List[BaseMessage], operator.add]
+
     question:            str
     rewritten_question:  str
-    context:             str
+
+
+    reranked_context: str
+
+    docs : list[Document]
+
     answer:              str
     relevance_score:     float
+    
 
 
 #  Step 2: Load components 
-
 embedding_model = HuggingFaceEmbeddings(
     model_name="sentence-transformers/all-MiniLM-L6-v2"
 )
@@ -51,20 +58,27 @@ retriever = vectorstore.as_retriever(
     search_type="mmr",
     search_kwargs={"k": 5, "fetch_k": 20}
 )
+#reranker module 
+reranker = CrossEncoder(
+     "cross-encoder/ms-marco-MiniLM-L-6-v2"
+)
+
 
 llm    = ChatGroq(model="llama-3.3-70b-versatile")
 parser = StrOutputParser()
 
-# ChromaDB L2 distance threshold.
-# Lower = closer match. Scores below this are considered relevant.
-RELEVANCE_THRESHOLD = 0.8
+
 
 SYSTEM_PROMPT = SystemMessage(content="""
-You are an AWS expert.
+You are a document assistant.
+
 Answer ONLY using the provided context.
+
 If the answer is not present in the context, say:
-"I could not find this information in the document."
-At the end of your answer, mention the source document and page number used.
+
+"I could not find this information in the uploaded document."
+
+Always cite the source document and page number.
 """)
 
 
@@ -79,6 +93,7 @@ def format_docs(docs):
             f"Source: {source}\nPage: {page}\n\nContent:\n{doc.page_content}"
         )
     return "\n\n".join(formatted)
+
 
 
 #  Step 4: Nodes 
@@ -103,7 +118,7 @@ Latest Question:
 """)
 
 def rewrite_query(state: State) -> dict:
-    print("\n--- REWRITE NODE ---")
+    print("\n REWRITE NODE ")
 
     # Build a readable history string from past messages
     history_lines = []
@@ -126,14 +141,13 @@ def rewrite_query(state: State) -> dict:
 
 
 # Node 2: retrieve 
-#
 
 def retrieve(state: State) -> dict:
     print("\n--- RETRIEVE NODE ---")
 
     results = vectorstore.similarity_search_with_score(
         state["rewritten_question"],
-        k=5
+        k=20
     )
 
     print("\nSimilarity Scores (L2 distance — lower = more relevant):")
@@ -144,34 +158,42 @@ def retrieve(state: State) -> dict:
     docs = [doc for doc, _ in results]
 
     return {
-        "context":  format_docs(docs),
+        "docs": docs,
         "relevance_score": best_score
     }
 
 
 #  Node 3: generate 
-
-def generate(state: State) -> dict:
+def generate(state: State):
     print("\n GENERATE NODE ")
 
-    history = state["messages"]
-
-    # Combine retrieved context + rewritten question as the latest human turn
-    current_turn = HumanMessage(content=f"""
+    current_turn = HumanMessage(
+        content=f"""
 Context from documents:
-{state['context']}
 
-Question: {state['rewritten_question']}
-""")
+{state['reranked_context']}
 
-    # LLM sees: system prompt + full history + current turn
-    messages_for_llm = [SYSTEM_PROMPT] + history + [current_turn]
-    response         = llm.invoke(messages_for_llm)
-    answer           = parser.invoke(response)
+Question:
+{state['rewritten_question']}
+"""
+    )
+
+    print("\n===== CONTEXT SENT TO LLM =====\n")
+    print(state["reranked_context"][:3000])
+    print("\n===============================\n")
+
+    messages_for_llm = (
+        [SYSTEM_PROMPT]
+        + state["messages"]
+        + [current_turn]
+    )
+
+    response = llm.invoke(messages_for_llm)
+
+    answer = parser.invoke(response)
 
     print(f"\nAnswer:\n{answer}")
 
-
     return {
         "answer": answer,
         "messages": [
@@ -180,15 +202,15 @@ Question: {state['rewritten_question']}
         ]
     }
 
-
-#  Node 4: not_found 
+# Node 4: not_found
 
 def not_found(state: State) -> dict:
     print("\n--- NOT FOUND NODE ---")
+
     answer = "I could not find relevant information in the document."
+
     print(answer)
 
-    # Still append to history so the LLM knows this question was unanswerable
     return {
         "answer": answer,
         "messages": [
@@ -197,14 +219,68 @@ def not_found(state: State) -> dict:
         ]
     }
 
+#Node 5 - Rerank 
+def rerank(state: State):
+    print("\n RERANK NODE ")
+
+    query = state["rewritten_question"]
+    docs = state["docs"]
+
+    pairs = [
+        (query, doc.page_content)
+        for doc in docs
+    ]
+
+    scores = reranker.predict(pairs)
+
+    ranked = list(zip(docs, scores))
+
+    print("\nTop Reranker Scores:\n")
+
+    for i, (doc, score) in enumerate(
+        sorted(ranked, key=lambda x: x[1], reverse=True)[:5]
+    ):
+        print(
+             f"\nRank {i+1}"
+        f"\nScore: {score:.4f}"
+        f"\nSource: {doc.metadata.get('source')}"
+        f"\nPage: {doc.metadata.get('page_label')}"
+        )
+
+    ranked.sort(
+        key=lambda x: x[1],
+        reverse=True
+    )
+
+    best_rerank_score = ranked[0][1]
+
+    top_docs = [
+        doc
+        for doc, score in ranked[:5]
+    ]
+
+    context = format_docs(top_docs)
+
+    return {
+        "reranked_context": context,
+        "docs": top_docs,
+         "relevance_score": float(best_rerank_score)
+    }
 
 # Step 5: Router 
+RERANK_THRESHOLD = 3.0
 
-def route_question(state: State) -> str:
+def route_question(state: State):
+
     score = state["relevance_score"]
-    print(f"\nRouting — best L2 score: {score:.4f}  (threshold: {RELEVANCE_THRESHOLD})")
 
-    if score < RELEVANCE_THRESHOLD:
+    print(
+        f"\nRouting — best reranker score: "
+        f"{score:.4f} "
+        f"(threshold: {RERANK_THRESHOLD})"
+    )
+
+    if score > RERANK_THRESHOLD:
         print("→ Relevant docs found → generate")
         return "generate"
 
@@ -220,15 +296,17 @@ graph_builder.add_node("rewrite",   rewrite_query)
 graph_builder.add_node("retrieve",  retrieve)
 graph_builder.add_node("generate",  generate)
 graph_builder.add_node("not_found", not_found)
+graph_builder.add_node("rerank" , rerank)
 
 graph_builder.add_edge(START,      "rewrite")
 graph_builder.add_edge("rewrite",  "retrieve")
+graph_builder.add_edge("retrieve" , "rerank")
 
 graph_builder.add_conditional_edges(
-    "retrieve",
+    "rerank",
     route_question,
     {
-        "generate":  "generate",
+        "generate": "generate",
         "not_found": "not_found"
     }
 )
@@ -263,7 +341,8 @@ while True:
             "question": question,
             "messages": [],          # MemorySaver merges with saved history
             "rewritten_question": "",
-            "context": "",
+             "docs": [],
+            "reranked_context": "",
             "answer": "",
             "relevance_score": 0.0
         },
